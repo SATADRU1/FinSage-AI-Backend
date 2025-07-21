@@ -1,0 +1,244 @@
+from ingest import vector_store
+from agno.agent import Agent
+from agno.knowledge.langchain import LangChainKnowledgeBase
+from agno.models.ollama import Ollama
+from agno.models.google.gemini import Gemini
+from agno.models.groq.groq import Groq
+from agno.tools.yfinance import YFinanceTools
+from retrieval_grader import retrieval_grader, small_talk_grader
+from deep_research import DeepResearch
+from tavily import TavilyClient
+import os
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.markdown import Markdown
+import sys
+from termcolor import colored
+from vars import *
+from langchain.memory import ConversationBufferMemory  # Import memory
+
+console = Console()
+
+load_dotenv()
+
+# # Get Tavily API key from environment variables or set it directly
+tavily_api_key = os.environ.get("TAVILY_API_KEY")
+tavily_client = TavilyClient(api_key=tavily_api_key)
+
+yf_tool = YFinanceTools(
+    stock_price=True,
+    analyst_recommendations=True,
+    stock_fundamentals=True,
+    historical_prices=True,
+    company_info=True,
+    company_news=True
+)
+researcher = DeepResearch(
+    max_search_calls=MAX_SEARCH_CALLS, max_depth=MAX_DEPTH)
+
+retriever = vector_store.as_retriever()
+knowledge_base = LangChainKnowledgeBase(retriever=retriever)
+
+if ENABLE_LOCAL:
+    llm = Ollama(id=LOCAL_LLM)
+    print("Using local LLM")
+else:
+    llm = Groq(REMOTE_LLM)
+    print("Using Groq LLM")
+
+tool_llm = get_llm_provider(get_llm_id("tool"))
+# Create agent
+agent = Agent(
+    model=llm,
+    knowledge=knowledge_base,
+    description="Answer to the user question from the knowledge base",
+    markdown=True,
+    search_knowledge=True,
+)
+
+
+def display_tool_calls(tool_calls):
+    """Display tool calls in a formatted way"""
+    print(colored("\n=== Tool Call History ===", "cyan"))
+    if not tool_calls:
+        print(colored("No tool calls were made", "yellow"))
+        return
+
+    for i, call in enumerate(tool_calls, 1):
+        print(colored(f"\nTool Call #{i}:", "yellow"))
+        if isinstance(call, dict):
+            print(colored(f"Tool: {call.get('name', 'Unknown')}", "green"))
+            print(colored(f"Input: {call.get('arguments', {})}", "blue"))
+            print(
+                colored(f"Output: {call.get('output', 'No output')}", "magenta"))
+        elif hasattr(call, 'tool'):
+            print(colored(f"Tool: {call.tool}", "green"))
+            print(colored(f"Input: {call.tool_input}", "blue"))
+            print(colored(f"Output: {call.tool_output}", "magenta"))
+        else:
+            print(colored(f"Tool Call Data: {call}", "red"))
+    print(colored("\n=== End Tool Call History ===\n", "cyan"))
+
+
+def process_query_flow(query: str, memory: ConversationBufferMemory, deep_search=False):
+    """
+    Process a query through the agent with retrieval grading.
+    Falls back to web search if grading score is 0.
+    """
+
+    agent_response = agent.run(query)
+
+    # Grade the retrieved documents
+    retrieved_docs = agent.get_relevant_docs_from_knowledge(query)
+    retrieved_docs = "\n\n".join([doc["content"] for doc in retrieved_docs])
+    print(colored("RETRIEVED DOCUMENTS: ", "green"))
+    print(colored(retrieved_docs, "yellow"))
+
+    grade_result = retrieval_grader.invoke(
+        {"question": query, "documents": retrieved_docs})
+
+    print(colored(f"Retrieval grade: {grade_result}", 'cyan'))
+
+    # If grade is 0, fall back to web search
+    rag_context = ""
+    if grade_result['score'] == 0:
+        if deep_search:
+            # --- Deep Research Path ---
+            print(colored("Initiating Deep Research...", 'magenta'))
+            try:
+                research_result = researcher.research(query)
+                web_research_context = research_result.get(
+                    "answer", "Deep research failed to produce an answer.")
+                # Potentially extract tool calls if DeepResearch class logs them
+                # tool_calls_history.extend(researcher.get_tool_calls()) # If implemented
+                print(colored("Deep Research completed.", "green"))
+            except Exception as e:
+                print(colored(f"Error during Deep Research: {e}", "red"))
+                web_research_context = f"Deep research encountered an error: {str(e)}"
+        else:
+            # --- Standard Web Search Path ---
+            print(colored("Initiating Web Search using Tavily/YFinance...", 'magenta'))
+            # Use a dedicated agent for web search + tools
+            web_search_agent = Agent(
+                model=tool_llm,  # Use the tool-focused LLM
+                # memory=memory, # Pass memory for context
+                description="""You are a Financial Assistant specialized in retrieving real-time and web-based information.
+                Your primary goal is to answer the user's query using the provided tools (Tavily Search, YFinance).
+
+                Instructions:
+                1. Analyze the query: {query}
+                2. Determine if real-time financial data (stock price) is needed. If yes, use yf_tool. Extract tickers/company names accurately.
+                3. Determine if recent news, general information regarding finance that do not involve stock prices, or broader context is needed. If yes, use tavily_client. Formulate a concise search query.
+                4. Execute the necessary tool calls. You MUST call the tools; do not just mention them.
+                5. If multiple stocks are mentioned, call yf_tool for each.
+                6. Synthesize the results from the tool calls into a factual answer to the original query.
+                7. If a tool fails, report that it failed but try to answer with other available information.
+                8. Respond *only* with the synthesized answer. Do not include descriptions of tool calls in the final output.
+                Current time: {current_datetime}
+                """,
+                markdown=True,
+                search_knowledge=False,  # Don't use RAG within this agent
+                tools=[tavily_client, yf_tool],  # Pass tool instances
+                show_tool_calls=True,  # Enable logging within Agno if it supports it
+                add_datetime_to_instructions=True,
+                # max_iterations=5 # Limit iterations to prevent loops
+                # error_handler=lambda e: print(f"Web search agent error: {e}") # Basic error handler
+            )
+            try:
+                # Pass query with memory context (Agno might handle memory implicitly if passed at init)
+                # response = web_search_agent.run(query) # Check Agno docs for memory usage
+                # If memory needs explicit passing in run:
+                history = memory.load_memory_variables({})["chat_history"]
+                response = web_search_agent.run(query, chat_history=history)
+
+                web_research_context = response.content
+                print(
+                    colored(f"Web Search Response: {web_research_context}", "magenta"))
+                # Try to get tool calls if Agno agent provides a method
+                # if hasattr(web_search_agent, 'get_tool_call_history'):
+                #     calls = web_search_agent.get_tool_call_history()
+                #     tool_calls_history.extend(calls)
+                # display_tool_calls(calls) # Display calls from this step
+                print(colored("Web Search completed.", "green"))
+            except Exception as e:
+                print(
+                    colored(f"Error during Web Search Agent execution: {str(e)}", "red"))
+                web_research_context = f"Web search encountered an error: {str(e)}"
+                # Log the exception traceback for debugging if needed
+                import traceback
+                traceback.print_exc()
+    else:
+        print(colored("RAG was perfect, no need for web search", "green"))
+        web_research_context = ""
+        rag_context = retrieved_docs
+    # === 5. Synthesis ===
+    print(colored("Synthesizing final answer...", "cyan"))
+    synthesis_agent = Agent(
+        model=llm,
+        # memory=memory, # Pass memory for conversational context
+        description="""You are a Financial Analyst Synthesizer. Your task is to combine information from different sources (internal knowledge, web research) into a single, comprehensive, and accurate answer to the user's query.
+
+        Instructions:
+        1. Review the original user query: {query}
+        2. Review the information retrieved from the internal knowledge base (RAG): {rag_context}
+        3. Review the information gathered from web search or deep research: {web_research_context}
+        4. Synthesize these pieces of information into a single, cohesive response.
+        5. Prioritize accuracy and relevance to the original query.
+        6. If both sources provide relevant information, integrate them smoothly. If one source is clearly more relevant or up-to-date (e.g., web search for real-time data), give it appropriate weight.
+        7. If RAG context exists, mention that the information is based on available documents and supplement/verify with web findings.
+        8. If numerical data (prices, metrics) is available from web/tools, include it accurately.
+        9. Structure the answer clearly using Markdown (headings, bullets).
+        10. If neither source provided a good answer, state that you couldn't find the information.
+        11. Respond directly to the user. Do not mention the internal steps (RAG, web search) unless clarifying the source of information.
+        """,
+        markdown=True,
+        # search_knowledge=False # Synthesis step doesn't need further searching
+    )
+
+    try:
+        # Prepare context for the synthesis prompt
+        synthesis_prompt_input = f"""Original Query: {query}
+
+        --- Information from Knowledge Base ---
+        {rag_context if rag_context else "No relevant information found in internal documents."}
+
+        --- Information from Web/Deep Research ---
+        {web_research_context if web_research_context else "No information gathered from web search or deep research."}
+
+        ---
+
+        Synthesize the above information to answer the original query comprehensively and accurately.
+        """
+        # Pass history if needed by Agno agent run method
+        history = memory.load_memory_variables({})["chat_history"]
+        final_response = synthesis_agent.run(
+            synthesis_prompt_input, chat_history=history)
+        final_answer = final_response.content
+
+    except Exception as e:
+        print(colored(f"Error during final synthesis: {e}", "red"))
+        final_answer = f"Sorry, I encountered an error while synthesizing the final answer: {str(e)}"
+
+    # Display all collected tool calls at the end (optional)
+    # print(colored("\n=== Full Tool Call Summary ===", "blue"))
+    # display_tool_calls(tool_calls_history)
+
+    print(colored("Processing complete.", "white", attrs=["bold"]))
+    return final_answer
+# else:
+#     print(colored("SMALL TALK detected.... Using Agent Response", 'magenta'))
+#     small_talk_agent = Agent(
+#         model=llm,
+#         description="Answer to the user question in a brief and concise manner",
+#         markdown=True,
+#         search_knowledge=False,
+#     )
+#     return small_talk_agent.run(query).content
+
+# # user_query = "how can i create agentic software using google gemini and python?"
+# with(open('query.txt', 'r')) as f:
+#     user_query = f.read()
+# if __name__ == "__main__":  # Main execution
+#     print(colored("\n--- Final Response ---\n", 'green'))
+#     response = answer_with_grading_and_fallback(user_query)
+#     console.print(Markdown(response.content))

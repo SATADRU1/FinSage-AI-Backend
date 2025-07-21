@@ -1,0 +1,17 @@
+langchain
+langchain_groq
+agno
+dotenv
+tavily-python
+typing
+rich
+streamlit
+langchain_ollama
+langchain_community
+termcolor
+uuid
+langchain_text_splitters
+langchain_chroma
+langchain_core
+pydantic
+yfinance
